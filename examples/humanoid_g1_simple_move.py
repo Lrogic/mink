@@ -5,7 +5,6 @@ import mujoco.viewer
 from loop_rate_limiters import RateLimiter
 
 import mink
-import numpy as np
 
 _HERE = Path(__file__).parent
 _XML = _HERE / "unitree_g1" / "scene_table.xml"
@@ -106,42 +105,51 @@ if __name__ == "__main__":
         data.mocap_pos[com_mid] = data.subtree_com[1]
 
         rate = RateLimiter(frequency=200.0, warn=False)
-        while viewer.is_running():
-            # Update task targets.
-            com_task.set_target(data.mocap_pos[com_mid])
-            for i, (hand_task, foot_task) in enumerate(zip(hand_tasks, feet_tasks)):
-                foot_task.set_target(mink.SE3.from_mocap_id(data, feet_mid[i]))
-                hand_task.set_target(mink.SE3.from_mocap_id(data, hands_mid[i]))
+        # Before the viewer loop
+        right_start_pose = mink.SE3.from_mocap_id(data, hands_mid[0])
+        right_start_pos = right_start_pose.translation().copy()
+        right_start_rot = right_start_pose.rotation()
 
-            vel = mink.solve_ik(
-                configuration, tasks, rate.dt, solver, damping=1e-1, limits=limits
-            )
-            configuration.integrate_inplace(vel, rate.dt)
-            mujoco.mj_camlight(model, data)
+        move_speed = 0.10   # meters per second
+        max_up = 0.35       # meters
+        elapsed = 0.0
 
-            # Note the below are optional: they are used to visualize the output of the
-            # fromto sensor which is used by the collision avoidance constraint.
-            mujoco.mj_fwdPosition(model, data)
-            mujoco.mj_sensorPos(model, data)
+        with mujoco.viewer.launch_passive(
+            model=model, data=data, show_left_ui=False, show_right_ui=False
+        ) as viewer:
+            while viewer.is_running():
+                elapsed += rate.dt
 
-            # J = configuration.get_frame_jacobian("right_palm", "site")
-            # nonzero = np.nonzero(np.linalg.norm(J, axis=0))[0]
-            # print("nonzero jacobian columns:", nonzero)
-            # for col in nonzero:
-            #     joint_id = None
-            #     for j in range(model.njnt):
-            #         start = model.jnt_dofadr[j]
-            #         width = {
-            #             mujoco.mjtJoint.mjJNT_FREE: 6,
-            #             mujoco.mjtJoint.mjJNT_BALL: 3,
-            #             mujoco.mjtJoint.mjJNT_SLIDE: 1,
-            #             mujoco.mjtJoint.mjJNT_HINGE: 1,
-            #         }[mujoco.mjtJoint(model.jnt_type[j])]
-            #         if start <= col < start + width:
-            #             joint_id = j
-            #             break
-            #     print(col, joint_id, mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id))
+                # Update COM target.
+                com_task.set_target(data.mocap_pos[com_mid])
 
-            # Visualize at fixed FPS.
-            viewer.sync()
-            rate.sleep()
+                # Update feet targets.
+                for i, foot_task in enumerate(feet_tasks):
+                    foot_task.set_target(mink.SE3.from_mocap_id(data, feet_mid[i]))
+
+                # Move right hand target upward over time.
+                up_amount = min(move_speed * elapsed, max_up)
+
+                right_target_pos = right_start_pos.copy()
+                right_target_pos[2] += up_amount
+
+                right_hand_target = mink.SE3.from_rotation_and_translation(
+                    rotation=right_start_rot,
+                    translation=right_target_pos,
+                )
+
+                hand_tasks[0].set_target(right_hand_target)
+
+                # Keep left hand unchanged/mouse-controlled.
+                hand_tasks[1].set_target(mink.SE3.from_mocap_id(data, hands_mid[1]))
+
+                # Solve IK.
+                vel = mink.solve_ik(
+                    configuration, tasks, rate.dt, solver, damping=1e-1, limits=limits
+                )
+
+                # Apply the IK velocity to the robot configuration.
+                configuration.integrate_inplace(vel, rate.dt)
+
+                viewer.sync()
+                rate.sleep()
