@@ -8,7 +8,41 @@ import mink
 import numpy as np
 
 _HERE = Path(__file__).parent
-_XML = _HERE / "unitree_g1" / "scene_no_table.xml"
+# Set True to weld pelvis at ManiSkill base_pose (no freejoint); uses absolute world waypoints.
+FIXED_BASE_TEST = True
+_XML = _HERE / "unitree_g1" / (
+    "scene_no_table_fixed_base.xml" if FIXED_BASE_TEST else "scene_no_table.xml"
+)
+
+LEG_JOINT_NAMES = [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+]
+
+
+def _frame_camera_on_robot(cam, pelvis_pos: np.ndarray, pelvis_rot_matrix: np.ndarray) -> None:
+    """Point the free camera at the pelvis, placed behind the robot's facing direction."""
+    lookat = pelvis_pos + np.array([0.0, 0.0, 0.25])
+    cam.lookat[:] = lookat
+    cam.distance = 2.2
+    cam.elevation = -15.0
+    # Pelvis +X is forward; place the camera on the horizontal opposite side.
+    forward = pelvis_rot_matrix[:, 0].copy()
+    forward[2] = 0.0
+    norm = np.linalg.norm(forward)
+    if norm > 1e-6:
+        back = -forward / norm
+        cam.azimuth = float(np.degrees(np.arctan2(back[1], back[0])))
 
 
 if __name__ == "__main__":
@@ -18,43 +52,50 @@ if __name__ == "__main__":
     feet = ["right_foot", "left_foot"]
     hands = ["right_palm", "left_palm"]
 
-    tasks = [
-        pelvis_orientation_task := mink.FrameTask(
-            frame_name="pelvis",
-            frame_type="body",
-            position_cost=0.0,
-            orientation_cost=1.0,
-            lm_damping=1.0,
-        ),
+    tasks = []
+    if not FIXED_BASE_TEST:
+        tasks.append(
+            pelvis_orientation_task := mink.FrameTask(
+                frame_name="pelvis",
+                frame_type="body",
+                position_cost=0.0,
+                orientation_cost=1.0,
+                lm_damping=1.0,
+            )
+        )
+    tasks.append(
         torso_orientation_task := mink.FrameTask(
             frame_name="torso_link",
             frame_type="body",
             position_cost=0.0,
             orientation_cost=1.0,
             lm_damping=1.0,
-        ),
-        posture_task := mink.PostureTask(model, cost=1e-1),
-        com_task := mink.ComTask(cost=10.0),
-    ]
+        )
+    )
+    tasks.append(posture_task := mink.PostureTask(model, cost=1e-1))
+    if not FIXED_BASE_TEST:
+        tasks.append(com_task := mink.ComTask(cost=10.0))
 
     feet_tasks = []
-    for foot in feet:
-        task = mink.FrameTask(
-            frame_name=foot,
-            frame_type="site",
-            position_cost=10.0,
-            orientation_cost=1.0,
-            lm_damping=1.0,
-        )
-        feet_tasks.append(task)
-    tasks.extend(feet_tasks)
+    if not FIXED_BASE_TEST:
+        for foot in feet:
+            task = mink.FrameTask(
+                frame_name=foot,
+                frame_type="site",
+                position_cost=10.0,
+                orientation_cost=1.0,
+                lm_damping=1.0,
+            )
+            feet_tasks.append(task)
+        tasks.extend(feet_tasks)
 
     hand_tasks = []
+    hand_position_cost = 10.0 if FIXED_BASE_TEST else 10.0
     for hand in hands:
         task = mink.FrameTask(
             frame_name=hand,
             frame_type="site",
-            position_cost=5.0,
+            position_cost=hand_position_cost,
             orientation_cost=0.0,
             lm_damping=1.0,
         )
@@ -80,6 +121,15 @@ if __name__ == "__main__":
         mink.ConfigurationLimit(model),
         collision_avoidance_limit,
     ]
+
+    ik_constraints = []
+    if FIXED_BASE_TEST:
+        leg_dof_indices = [
+            model.jnt_dofadr[model.joint(joint_name).id] for joint_name in LEG_JOINT_NAMES
+        ]
+        ik_constraints.append(
+            mink.DofFreezingTask(model, dof_indices=leg_dof_indices)
+        )
 
     com_mid = model.body("com_target").mocapid[0]
     feet_mid = [model.body(f"{foot}_target").mocapid[0] for foot in feet]
@@ -164,22 +214,199 @@ if __name__ == "__main__":
 
 
 
-    # Example trajectory object (user-provided style)
+    # Same waypoint list in both modes; base_pose converts ManiSkill world poses to
+    # robot-relative offsets, then applies them at the current/fixed pelvis pose.
     TRAJ = {
         "poses": [
-            [-0.08, 0.1, 0.845, 0.0000, 0.7071, -0.7071, 0.0000],
-            [-0.15, 0.1, 0.80, 0.0000, 0.7071, -0.7071, 0.0000],
-            [0.15, 0.1, 0.80, 0.0000, 0.7071, -0.7071, 0.0000],
-            [-0.20, 0.025, 0.6409, 0.7068956888241477, 0.707317701654041, 0.00018099998471816394, 0.00034826381457648224],
+        [
+            -0.2,
+            0.025,
+            0.6409339256541683,
+            0.7068956888241477,
+            0.707317701654041,
+            0.00018099998471816394,
+            0.00034826381457648224
         ],
-        "pos_tol": 0.01,
+        [
+            -0.184047494794631,
+            0.029840778557341213,
+            0.6796916034950917,
+            0.7081192135306263,
+            0.7060770727253313,
+            0.00228507555166261,
+            -0.004138264143051948
+        ],
+        [
+            -0.168094989589262,
+            0.034681557114682425,
+            0.7184492813360152,
+            0.7093120321707889,
+            0.7048281929606509,
+            0.00440481286469608,
+            -0.008617252995961779
+        ],
+        [
+            -0.152142484383893,
+            0.039522335672023644,
+            0.7572069591769387,
+            0.710474110674306,
+            0.7035712159246243,
+            0.006540172308655456,
+            -0.013088480816079127
+        ],
+        [
+            -0.13618997917852402,
+            0.044363114229364856,
+            0.7959646370178621,
+            0.7116054166512511,
+            0.702306295335484,
+            0.008691112908214782,
+            -0.01755172587422396
+        ],
+        [
+            -0.12023747397315503,
+            0.04920389278670606,
+            0.8347223148587856,
+            0.7127059193926731,
+            0.7010335850534819,
+            0.010857592328942189,
+            -0.02200676665313765
+        ],
+        [
+            -0.10428496876778601,
+            0.05404467134404728,
+            0.8734799926997091,
+            0.7137755898710701,
+            0.6997532390692954,
+            0.01303956687845227,
+            -0.026453381860508614
+        ],
+        [
+            -0.07152128060869672,
+            0.050649520466326314,
+            0.8808452602532724,
+            0.7152086322308332,
+            0.6982790105170058,
+            0.019954818584649384,
+            -0.022019106910724305
+        ],
+        [
+            -0.03205949217680086,
+            0.043972918107905254,
+            0.8757028112179035,
+            0.7167156252295368,
+            0.6966327277423,
+            0.02872360172373217,
+            -0.014018198677907892
+        ],
+        [
+            0.0074022962550949895,
+            0.037296315749484193,
+            0.8705603621825346,
+            0.7181302304234835,
+            0.6948741475792319,
+            0.03745793774747947,
+            -0.005982815194902531
+        ],
+        [
+            0.04686408468699085,
+            0.030619713391063137,
+            0.8654179131471657,
+            0.7194518148186637,
+            0.6930038422153517,
+            0.046156361033170536,
+            0.0020859446461802167
+        ],
+        [
+            0.08632587311888673,
+            0.023943111032642073,
+            0.8602754641117968,
+            0.7206797588404965,
+            0.6910224033035107,
+            0.054817414607564834,
+            0.010186971384389579
+        ],
+        [
+            0.12578766155078264,
+            0.017266508674221005,
+            0.8551330150764279,
+            0.7218134565014327,
+            0.688930441837256,
+            0.06343965040945945,
+            0.01831914515753878
+        ],
+        [
+            0.16524944998267846,
+            0.010589906315799952,
+            0.8499905660410589,
+            0.7228523155664305,
+            0.6867285880226294,
+            0.07202162955049983,
+            0.026481335872383844
+        ],
+        [
+            0.17766279309142302,
+            0.006790837768152886,
+            0.8274478045173825,
+            0.7217892441907463,
+            0.6881684418409949,
+            0.06862063379373257,
+            0.027123628858154388
+        ],
+        [
+            0.16713198283221042,
+            0.00543267021452231,
+            0.7901450287447398,
+            0.7189495822277903,
+            0.692548501379255,
+            0.05502313642880732,
+            0.021459867412698806
+        ],
+        [
+            0.15660117257299777,
+            0.004074502660891731,
+            0.7528422529720968,
+            0.7160447140068642,
+            0.6966465028645852,
+            0.04135623092252526,
+            0.01591476525917259
+        ],
+        [
+            0.14607036231378517,
+            0.0027163351072611525,
+            0.715539477199454,
+            0.7130782395015844,
+            0.700461422461218,
+            0.027626003163011503,
+            0.01048922981754308
+        ],
+        [
+            0.13553955205457258,
+            0.0013581675536305767,
+            0.6782367014268111,
+            0.7100537727290245,
+            0.7039923718656851,
+            0.01383855476926566,
+            0.005184070804310106
+        ],
+        [
+            0.12500874179535995,
+            0.0,
+            0.6409339256541683,
+            0.7069749392341962,
+            0.7072385985611961,
+            0.0,
+            0.0
+        ]
+    ],
+        "pos_tol": 0.03 if FIXED_BASE_TEST else 0.03,
         "rot_tol": 10,
         "stable_steps": 10,
         "base_pose": [0.0, 0.5, 0.755, 0.7071068, 0.0, 0.0, -0.7071068],
     }
     DEBUG_LOG_EVERY = 25  # steps between log lines (set to 1 for every iteration)
     SIM_FREQUENCY = 100.0  # viewer/IK loop rate (Hz); lower = slower overall
-    IK_VELOCITY_SCALE = 0.01  # fraction of solved joint velocity to apply (0-1)
+    IK_VELOCITY_SCALE = 0.1 if FIXED_BASE_TEST else 0.1
 
     def _quat_angle_rad(q1, q2):
         q1 = np.asarray(q1, dtype=float) / max(np.linalg.norm(q1), 1e-8)
@@ -224,11 +451,18 @@ if __name__ == "__main__":
     with mujoco.viewer.launch_passive(
         model=model, data=data, show_left_ui=False, show_right_ui=False
     ) as viewer:
-        mujoco.mjv_defaultFreeCamera(model, viewer.cam)
         # Initialize to the home keyframe.
         configuration.update_from_keyframe("teleop")
+        configuration.update()
+        pelvis_pose = configuration.get_transform_frame_to_world("pelvis", "body")
+        _frame_camera_on_robot(
+            viewer.cam,
+            pelvis_pose.translation(),
+            pelvis_pose.rotation().as_matrix(),
+        )
         posture_task.set_target_from_configuration(configuration)
-        pelvis_orientation_task.set_target_from_configuration(configuration)
+        if not FIXED_BASE_TEST:
+            pelvis_orientation_task.set_target_from_configuration(configuration)
         torso_orientation_task.set_target_from_configuration(configuration)
         # Apply optional base pose from TRAJ after keyframe to avoid overwrite.
         # if "base_pose" in TRAJ:
@@ -252,10 +486,19 @@ if __name__ == "__main__":
         step = 0
         traj = WaypointTrajectory(
             TRAJ["poses"], pos_tol=TRAJ["pos_tol"], rot_tol=TRAJ["rot_tol"], stable_steps=TRAJ["stable_steps"],
-            relative_robot_pose=TRAJ["base_pose"] if "base_pose" in TRAJ else None,
-            curr_robot_pose=robot_ref_pose
+            relative_robot_pose=TRAJ["base_pose"],
+            curr_robot_pose=robot_ref_pose,
         )
-        if traj.relative_poses:
+        if FIXED_BASE_TEST:
+            print("FIXED_BASE_TEST: pelvis welded, leg DoFs frozen, absolute waypoints.")
+            print(f"Pelvis world: {robot_ref_pose.translation()}")
+            for i, wp in enumerate(traj.waypoints):
+                print(f"  WP[{i}] target: {wp.translation()}")
+            print(
+                "Initial right_palm: "
+                f"{configuration.get_transform_frame_to_world('right_palm', 'site').translation()}"
+            )
+        elif traj.relative_poses:
             print("Waypoint world targets (from relative transform):")
             for i, rel in enumerate(traj.relative_poses):
                 world = robot_ref_pose @ rel
@@ -266,11 +509,13 @@ if __name__ == "__main__":
             step += 1
 
             # Update COM target.
-            com_task.set_target(data.mocap_pos[com_mid])
+            if not FIXED_BASE_TEST:
+                com_task.set_target(data.mocap_pos[com_mid])
 
             # Update feet targets.
-            for i, foot_task in enumerate(feet_tasks):
-                foot_task.set_target(mink.SE3.from_mocap_id(data, feet_mid[i]))
+            if not FIXED_BASE_TEST:
+                for i, foot_task in enumerate(feet_tasks):
+                    foot_task.set_target(mink.SE3.from_mocap_id(data, feet_mid[i]))
 
             # Set right hand target from trajectory.
             # Get the robot's reference frame pose (pelvis)
@@ -283,7 +528,13 @@ if __name__ == "__main__":
 
             # Solve IK.
             vel = mink.solve_ik(
-                configuration, tasks, rate.dt, solver, damping=1e-1, limits=limits
+                configuration,
+                tasks,
+                rate.dt,
+                solver,
+                damping=1e-1,
+                limits=limits,
+                constraints=ik_constraints or None,
             )
             vel *= IK_VELOCITY_SCALE
 
