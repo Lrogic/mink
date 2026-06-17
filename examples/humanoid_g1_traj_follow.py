@@ -10,6 +10,9 @@ import numpy as np
 _HERE = Path(__file__).parent
 # Set True to weld pelvis at ManiSkill base_pose (no freejoint); uses absolute world waypoints.
 FIXED_BASE_TEST = True
+# Step MuJoCo physics (gravity + position actuators) instead of kinematic IK only.
+# Currently supported with FIXED_BASE_TEST=True only.
+DYNAMIC_MODE = True
 _XML = _HERE / "unitree_g1" / (
     "scene_no_table_fixed_base.xml" if FIXED_BASE_TEST else "scene_no_table.xml"
 )
@@ -30,6 +33,23 @@ LEG_JOINT_NAMES = [
 ]
 
 
+def _set_position_actuator_targets(
+    model: mujoco.MjModel,
+    configuration: mink.Configuration,
+    data: mujoco.MjData,
+    leg_qpos_hold: dict[str, float] | None = None,
+) -> None:
+    """Map IK joint targets to position actuator controls."""
+    for i in range(model.nu):
+        joint_id = int(model.actuator_trnid[i, 0])
+        qadr = int(model.jnt_qposadr[joint_id])
+        joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        if leg_qpos_hold is not None and joint_name in leg_qpos_hold:
+            data.ctrl[i] = leg_qpos_hold[joint_name]
+        else:
+            data.ctrl[i] = configuration.data.qpos[qadr]
+
+
 def _frame_camera_on_robot(cam, pelvis_pos: np.ndarray, pelvis_rot_matrix: np.ndarray) -> None:
     """Point the free camera at the pelvis, placed behind the robot's facing direction."""
     lookat = pelvis_pos + np.array([0.0, 0.0, 0.25])
@@ -46,6 +66,9 @@ def _frame_camera_on_robot(cam, pelvis_pos: np.ndarray, pelvis_rot_matrix: np.nd
 
 
 if __name__ == "__main__":
+    if DYNAMIC_MODE and not FIXED_BASE_TEST:
+        raise ValueError("DYNAMIC_MODE requires FIXED_BASE_TEST=True for now.")
+
     model = mujoco.MjModel.from_xml_path(_XML.as_posix())
 
     configuration = mink.Configuration(model)
@@ -480,6 +503,27 @@ if __name__ == "__main__":
             mink.move_mocap_to_frame(model, data, f"{hand}_target", hand, "site")
         data.mocap_pos[com_mid] = data.subtree_com[1]
 
+        leg_qpos_hold = {
+            name: float(
+                configuration.data.qpos[model.jnt_qposadr[model.joint(name).id]]
+            )
+            for name in LEG_JOINT_NAMES
+        }
+        print(f"leg_qpos_hold: {leg_qpos_hold}")
+        print(f"configuration.data.qpos: {configuration.data.qpos}")
+        print(f"model.jnt_qposadr: {model.jnt_qposadr}")
+        print(f"length of configuration.data.qpos: {len(configuration.data.qpos)}")
+        print(f"length of model.jnt_qposadr: {len(model.jnt_qposadr)}")
+        print(f"length of LEG_JOINT_NAMES: {len(LEG_JOINT_NAMES)}")
+        print(f"length of leg_qpos_hold: {len(leg_qpos_hold)}")
+        # print(f"length of model.joint(name).id: {len(model.joint("left_hip_pitch_joint").id)}")
+        # print(f"length of model.joint(name).id: {len(model.joint("left_hip_pitch_joint").id)}")
+        if DYNAMIC_MODE:
+            _set_position_actuator_targets(
+                model, configuration, data, leg_qpos_hold=leg_qpos_hold
+            )
+            mujoco.mj_forward(model, data)
+
         robot_ref_pose = configuration.get_transform_frame_to_world("pelvis", "body")
 
         rate = RateLimiter(frequency=SIM_FREQUENCY, warn=False)
@@ -489,6 +533,11 @@ if __name__ == "__main__":
             relative_robot_pose=TRAJ["base_pose"],
             curr_robot_pose=robot_ref_pose,
         )
+        if DYNAMIC_MODE:
+            print(
+                "DYNAMIC_MODE: closed-loop IK + mj_step "
+                f"({SIM_FREQUENCY:.0f} Hz, gravity on)."
+            )
         if FIXED_BASE_TEST:
             print("FIXED_BASE_TEST: pelvis welded, leg DoFs frozen, absolute waypoints.")
             print(f"Pelvis world: {robot_ref_pose.translation()}")
@@ -507,6 +556,9 @@ if __name__ == "__main__":
 
         while viewer.is_running():
             step += 1
+
+            if DYNAMIC_MODE:
+                configuration.update(data.qpos)
 
             # Update COM target.
             if not FIXED_BASE_TEST:
@@ -539,7 +591,13 @@ if __name__ == "__main__":
             vel *= IK_VELOCITY_SCALE
 
             # Apply the IK velocity to the robot configuration.
-            configuration.integrate_inplace(vel, rate.dt)
+            configuration.integrate_inplace(vel, rate.dt) 
+            if DYNAMIC_MODE:
+                _set_position_actuator_targets(
+                    model, configuration, data, leg_qpos_hold=leg_qpos_hold
+                )
+                mujoco.mj_step(model, data)
+                configuration.update(data.qpos)
 
             # Check whether the hand is within tolerances of the current waypoint
             # and advance if it has been stable for the required number of steps.
