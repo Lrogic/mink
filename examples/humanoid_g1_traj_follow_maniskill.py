@@ -91,6 +91,16 @@ SIM_FREQUENCY = 100.0
 IK_VELOCITY_SCALE = 0.1
 DEBUG_LOG_EVERY = 25
 
+# PhysX joint-drive gains for --dynamic. The IK runs closed-loop (the simulated
+# qpos is read back each step) with IK_VELOCITY_SCALE=0.1, so the drive only ever
+# sees a tiny per-step position command; the steady-state gravity sag is roughly
+# G / (stiffness * IK_VELOCITY_SCALE), hence the high stiffness. Damping is kept
+# near critical for the arm links (heavily overdamped values like 4e2 stall the
+# commanded motion and the hand never reaches the waypoints).
+DRIVE_STIFFNESS = 2e4
+DRIVE_DAMPING = 80.0
+DRIVE_FORCE_LIMIT = 2000.0
+
 
 def _quat_angle_rad(q1, q2) -> float:
     """Geodesic angle [rad] between two wxyz quaternions."""
@@ -257,7 +267,9 @@ def main() -> None:
         if args.dynamic:
             for joint, target in zip(robot.active_joints, q_sapien0):
                 joint.set_drive_property(
-                    stiffness=4e3, damping=4e2, force_limit=1000
+                    stiffness=DRIVE_STIFFNESS,
+                    damping=DRIVE_DAMPING,
+                    force_limit=DRIVE_FORCE_LIMIT,
                 )
                 joint.set_drive_target(float(target))
 
