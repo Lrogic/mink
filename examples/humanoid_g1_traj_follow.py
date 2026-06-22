@@ -1,11 +1,12 @@
 from pathlib import Path
 
+import contextlib
 import mujoco
 import mujoco.viewer
 from loop_rate_limiters import RateLimiter
 import argparse
 import json
-from typing import Any
+from typing import Any, Iterator
 
 import mink
 import numpy as np
@@ -86,6 +87,66 @@ def _load_json(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
+def _add_waypoint_markers(scn: mujoco.MjvScene, traj: Any, start_idx: int = 0) -> None:
+    """Draw trajectory waypoints as colored spheres in an MjvScene."""
+    for i in range(len(traj.waypoints)):
+        if traj.relative_poses:
+            waypoint_world = traj.start_pose @ traj.relative_poses[i]
+        else:
+            waypoint_world = traj.waypoints[i]
+        if i == traj.index:
+            rgba = np.array([0.0, 1.0, 0.0, 0.8], dtype=np.float32)
+        else:
+            rgba = np.array([1.0, 0.0, 0.0, 0.5], dtype=np.float32)
+        geom_idx = start_idx + i
+        scn.ngeom = geom_idx + 1
+        mujoco.mjv_initGeom(
+            scn.geoms[geom_idx],
+            mujoco.mjtGeom.mjGEOM_SPHERE,
+            np.array([0.02, 0.02, 0.02], dtype=np.float64).reshape(3, 1),
+            waypoint_world.translation().reshape(3, 1),
+            np.eye(3, dtype=np.float32).flatten().reshape(9, 1),
+            rgba.reshape(4, 1),
+        )
+
+
+@contextlib.contextmanager
+def _maybe_launch_viewer(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    *,
+    enabled: bool,
+) -> Iterator[mujoco.viewer.Handle | None]:
+    if enabled:
+        with mujoco.viewer.launch_passive(
+            model=model, data=data, show_left_ui=False, show_right_ui=False
+        ) as viewer:
+            yield viewer
+    else:
+        yield None
+
+
+def _step_limit(max_steps: int | None, max_seconds: float | None, sim_frequency: float) -> int | None:
+    limits = []
+    if max_steps is not None:
+        limits.append(max_steps)
+    if max_seconds is not None:
+        limits.append(int(max_seconds * sim_frequency))
+    return min(limits) if limits else None
+
+
+def _ensure_offscreen_framebuffer(
+    model: mujoco.MjModel, width: int, height: int
+) -> None:
+    """Grow the model offscreen buffer if the requested video size exceeds it."""
+    vis_global = model.vis.global_
+    if width > vis_global.offwidth:
+        vis_global.offwidth = width
+    if height > vis_global.offheight:
+        vis_global.offheight = height
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Mink waypoint tracking"
@@ -96,6 +157,42 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to scene/object JSON config",
     )
+    parser.add_argument(
+        "--record",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Save an MP4 video to PATH (headless unless --with-viewer is set)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Stop after this many simulation steps",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Stop after this many seconds of simulated time",
+    )
+    parser.add_argument(
+        "--with-viewer",
+        action="store_true",
+        help="Show the interactive viewer while recording",
+    )
+    parser.add_argument(
+        "--record-width",
+        type=int,
+        default=1280,
+        help="Video width in pixels (default: 1280)",
+    )
+    parser.add_argument(
+        "--record-height",
+        type=int,
+        default=720,
+        help="Video height in pixels (default: 720)",
+    )
     return parser.parse_args()
 
 
@@ -103,7 +200,19 @@ if __name__ == "__main__":
     if DYNAMIC_MODE and not FIXED_BASE_TEST:
         raise ValueError("DYNAMIC_MODE requires FIXED_BASE_TEST=True for now.")
 
+    DEBUG_LOG_EVERY = 25  # steps between log lines (set to 1 for every iteration)
+    SIM_FREQUENCY = 100.0  # viewer/IK loop rate (Hz); lower = slower overall
+    IK_VELOCITY_SCALE = 0.1 if FIXED_BASE_TEST else 0.1
+
     args = parse_args()
+    use_viewer = args.record is None or args.with_viewer
+    if args.record and not use_viewer and _step_limit(
+        args.max_steps, args.max_seconds, SIM_FREQUENCY
+    ) is None:
+        raise ValueError(
+            "Headless recording requires --max-steps or --max-seconds."
+        )
+
     model = mujoco.MjModel.from_xml_path(_XML.as_posix())
 
     configuration = mink.Configuration(model)
@@ -270,11 +379,6 @@ if __name__ == "__main__":
                 relative_pose = robot_pose.inverse() @ pose
                 self.relative_poses.append(relative_pose)
 
-
-    DEBUG_LOG_EVERY = 25  # steps between log lines (set to 1 for every iteration)
-    SIM_FREQUENCY = 100.0  # viewer/IK loop rate (Hz); lower = slower overall
-    IK_VELOCITY_SCALE = 0.1 if FIXED_BASE_TEST else 0.1
-
     def _quat_angle_rad(q1, q2):
         q1 = np.asarray(q1, dtype=float) / max(np.linalg.norm(q1), 1e-8)
         q2 = np.asarray(q2, dtype=float) / max(np.linalg.norm(q2), 1e-8)
@@ -283,15 +387,40 @@ if __name__ == "__main__":
     def _fmt_xyz(v):
         return f"[{v[0]:+.4f}, {v[1]:+.4f}, {v[2]:+.4f}]"
 
-    with mujoco.viewer.launch_passive(
-        model=model, data=data, show_left_ui=False, show_right_ui=False
-    ) as viewer:
+    writer = None
+    renderer = None
+    if args.record:
+        try:
+            import imageio.v2 as imageio
+        except ImportError as exc:
+            raise ImportError(
+                "Recording requires imageio and imageio-ffmpeg. "
+                "Install with: pip install imageio imageio-ffmpeg"
+            ) from exc
+        record_path = Path(args.record)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_offscreen_framebuffer(model, args.record_width, args.record_height)
+        renderer = mujoco.Renderer(
+            model, height=args.record_height, width=args.record_width
+        )
+        writer = imageio.get_writer(record_path.as_posix(), fps=int(SIM_FREQUENCY))
+        print(f"Recording to {record_path} at {int(SIM_FREQUENCY)} fps")
+
+    stop_step = _step_limit(args.max_steps, args.max_seconds, SIM_FREQUENCY)
+
+    with _maybe_launch_viewer(model, data, enabled=use_viewer) as viewer:
+        if viewer is not None:
+            cam = viewer.cam
+        else:
+            cam = mujoco.MjvCamera()
+            cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+
         # Initialize to the home keyframe.
         configuration.update_from_keyframe("teleop")
         configuration.update()
         pelvis_pose = configuration.get_transform_frame_to_world("pelvis", "body")
         _frame_camera_on_robot(
-            viewer.cam,
+            cam,
             pelvis_pose.translation(),
             pelvis_pose.rotation().as_matrix(),
         )
@@ -369,7 +498,11 @@ if __name__ == "__main__":
                 print(f"  [{i}] {world.translation()}")
             print(f"Current right_palm: {configuration.get_transform_frame_to_world('right_palm', 'site').translation()}")
 
-        while viewer.is_running():
+        while True:
+            if stop_step is not None and step >= stop_step:
+                break
+            if use_viewer and not viewer.is_running():
+                break
             step += 1
 
             if DYNAMIC_MODE:
@@ -445,26 +578,28 @@ if __name__ == "__main__":
             if traj.update_if_stable(pos_err, rot_err):
                 print(f"Advanced to waypoint {traj.index}")
 
-            # Draw trajectory waypoints in world frame for debugging.
-            viewer.user_scn.ngeom = 0
-            for i in range(len(traj.waypoints)):
-                if traj.relative_poses:
-                    waypoint_world = traj.start_pose @ traj.relative_poses[i]
-                else:
-                    waypoint_world = traj.waypoints[i]
-                if i == traj.index:
-                    rgba = np.array([0.0, 1.0, 0.0, 0.8], dtype=np.float32)
-                else:
-                    rgba = np.array([1.0, 0.0, 0.0, 0.5], dtype=np.float32)
-                viewer.user_scn.ngeom += 1
-                mujoco.mjv_initGeom(
-                    viewer.user_scn.geoms[viewer.user_scn.ngeom - 1],
-                    mujoco.mjtGeom.mjGEOM_SPHERE,
-                    np.array([0.02, 0.02, 0.02], dtype=np.float64).reshape(3, 1),
-                    waypoint_world.translation().reshape(3, 1),
-                    np.eye(3, dtype=np.float32).flatten().reshape(9, 1),
-                    rgba.reshape(4, 1),
-                )
+            _frame_camera_on_robot(
+                cam,
+                robot_ref_pose.translation(),
+                robot_ref_pose.rotation().as_matrix(),
+            )
 
-            viewer.sync()
-            rate.sleep()
+            # Draw trajectory waypoints in world frame for debugging.
+            if viewer is not None:
+                viewer.user_scn.ngeom = 0
+                _add_waypoint_markers(viewer.user_scn, traj)
+                viewer.sync()
+
+            if writer is not None:
+                renderer.update_scene(data, cam)
+                _add_waypoint_markers(renderer.scene, traj, start_idx=renderer.scene.ngeom)
+                writer.append_data(renderer.render())
+
+            if use_viewer:
+                rate.sleep()
+
+    if writer is not None:
+        writer.close()
+        print(f"Saved recording ({step} frames)")
+    if renderer is not None:
+        renderer.close()
