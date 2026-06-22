@@ -160,12 +160,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _frame_sapien_viewer(viewer, lookat: np.ndarray) -> None:
+    """Point the SAPIEN free camera at *lookat* (pelvis-ish)."""
+    lookat = np.asarray(lookat, dtype=float)
+    cam_xyz = lookat + np.array([-2.0, 0.0, 0.5])
+    viewer.set_camera_xyz(float(cam_xyz[0]), float(cam_xyz[1]), float(cam_xyz[2]))
+    dx, dy, dz = lookat - cam_xyz
+    horiz = float(np.hypot(dx, dy))
+    viewer.set_camera_rpy(r=0.0, p=-float(np.arctan2(dz, horiz)), y=0.0)
+    viewer.window.set_camera_parameters(near=0.05, far=100, fovy=1)
+
+
 def _build_sapien(base_pose: list[float]):
     """Load the G1 into a SAPIEN scene. Returns (scene, robot, name->active-index)."""
     import sapien
 
     scene = sapien.Scene()
     scene.set_timestep(1.0 / SIM_FREQUENCY)
+    scene.set_ambient_light([0.5, 0.5, 0.5])
+    scene.add_directional_light([0, 0, -1], [0.8, 0.8, 0.8])
+    scene.add_ground(altitude=0)
     loader = scene.create_urdf_loader()
     loader.fix_root_link = True
     robot = loader.load(str(_URDF))
